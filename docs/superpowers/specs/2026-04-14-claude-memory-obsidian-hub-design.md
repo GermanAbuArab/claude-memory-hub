@@ -50,6 +50,13 @@ The user already has:
 - **Storage:** SQLite with sqlite-vec, 384-dim embeddings via Transformers.js
 - **Status:** Already installed and working
 - **Action:** No changes needed. Keep as-is.
+- **Config location:** Already configured in each profile's `.claude/settings.json` (personal, roku, blend).
+
+> **Note on settings.json hierarchy:** Claude Code profiles have two settings files:
+> - `~/.profile-claude/settings.json` — profile-level settings
+> - `~/.profile-claude/.claude/settings.json` — Claude-internal settings
+>
+> episodic-memory is in the `.claude/settings.json` files. New MCP servers (obsidian, memory-service) will be added to the **profile-level** `settings.json` to keep them separate. Both are loaded at session start.
 
 ### Layer 2: Curated Knowledge Base (Obsidian Vault + MCP-Obsidian.org)
 
@@ -67,7 +74,7 @@ The user already has:
 │   ├── patterns/                  # Reusable code patterns
 │   ├── conventions/               # Naming, git, style conventions
 │   ├── tools/                     # Notes about tools and configs
-│   └── learnings/                 # Lessons learned across projects
+│   └── learnings/                 # Curated lessons (manually written or promoted from memory-service)
 ├── projects/
 │   ├── roku/
 │   │   ├── decisions/             # Architecture Decision Records
@@ -94,7 +101,7 @@ Each Claude Code profile's CLAUDE.md includes vault scope instructions:
 
 - **roku profile:** Focus on `projects/roku/` + `_shared/`
 - **blend profile:** Focus on `projects/blend/` + `_shared/`
-- **personal profile:** Access all of `projects/` + `personal/`
+- **personal profile:** Access all of `projects/` + `personal/` (intentionally broad — this is the "superuser" profile for cross-project context)
 
 ### Layer 3: Semantic Memory (mcp-memory-service + ChromaDB)
 
@@ -118,7 +125,12 @@ Each Claude Code profile's CLAUDE.md includes vault scope instructions:
 | Explicit write (user or Claude writes notes) | Implicit capture (harvested from sessions) |
 | Structured by folders | Searchable by meaning and time |
 
-**Flow:** Claude searches vault first (structured knowledge). If not found, falls back to mcp-memory-service (semantic recall). Valuable findings from memory-service get consolidated as permanent vault notes.
+**Search behavior:** Claude has access to both tools simultaneously and will use whichever seems most relevant for the query. In practice:
+- Factual/structural questions ("what's the deploy process for roku?") → vault first (structured knowledge)
+- Fuzzy/conceptual questions ("how did we handle auth?") → memory-service (semantic search)
+- Valuable findings from memory-service get consolidated as permanent vault notes over time
+
+This is enforced via CLAUDE.md instructions per profile (see concrete example below), not via hooks. Opportunistic use of both tools is acceptable and often better than rigid sequencing.
 
 ### Layer 4: Codebase Knowledge Graph (Graphify)
 
@@ -147,7 +159,11 @@ Optional PreToolUse hook reminds Claude to check the graph before brute-force se
 
 ## Configuration
 
-### MCP Servers (added to each profile's settings.json)
+### MCP Servers (added to each profile's `settings.json`)
+
+> **Target file:** `~/.personal-claude/settings.json`, `~/.roku-claude/settings.json`, `~/.blend-claude/settings.json` (the profile-level file, NOT the `.claude/settings.json` inside each).
+
+> **Important:** MCP servers are local processes that run on the user's machine. They are unaffected by profile-specific settings like `ANTHROPIC_BASE_URL` (e.g., roku's ai-hub-lite URL). Each MCP server communicates with Claude Code via stdio, not HTTP.
 
 ```json
 {
@@ -164,22 +180,75 @@ Optional PreToolUse hook reminds Claude to check the graph before brute-force se
 }
 ```
 
-> Note: Exact command/args to be verified during implementation against each tool's README.
+> **Pre-implementation task:** Before Phase 2, verify exact package names and CLI args against each tool's current README. The `@mcp-obsidian/server` package name above is a placeholder — the actual npm package for MCP-Obsidian.org must be confirmed. This is a blocking task before any installation.
 
 ### Hooks
 
 #### SessionEnd Hook (all profiles)
-Runs `memory_harvest` to extract learnings from the completed session and optionally write key decisions to the vault.
+
+Uses mcp-memory-service's `memory_harvest` tool to extract learnings from the completed session.
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "type": "command",
+        "command": "echo 'Session ended. Memory harvest will run on next session start via CLAUDE.md instruction.'"
+      }
+    ]
+  }
+}
+```
+
+> **Implementation note:** `memory_harvest` is an MCP tool, not a CLI command. It cannot be called directly from a shell hook. Instead, the CLAUDE.md instruction will tell Claude to run `memory_harvest` at the start of each session on the previous session's learnings. The SessionEnd hook is a placeholder for future automation if mcp-memory-service adds CLI support.
+>
+> Alternative: A prompt-type hook (if supported) that asks Claude to summarize and store key decisions before session end.
 
 #### PreToolUse Hook (per project, optional)
 For projects with Graphify: reminds Claude to check GRAPH_REPORT.md before Glob/Grep operations.
 
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "prompt",
+        "matcher": "Glob|Grep",
+        "prompt": "Before searching, check if graphify-out/GRAPH_REPORT.md has the information you need."
+      }
+    ]
+  }
+}
+```
+
 ### CLAUDE.md Additions
 
-Each profile gets an `## Obsidian Memory` section with:
-- Vault scope (which project folder to focus on)
-- Memory tagging convention (tag memories with source profile)
-- Graphify instructions (if applicable)
+Each profile gets an `## Obsidian Memory` section. Example for the roku profile:
+
+```markdown
+## Obsidian Memory
+
+You have access to an Obsidian vault via the `obsidian` MCP server and a semantic memory via the `memory-service` MCP server.
+
+### Vault (obsidian MCP)
+- Focus on `projects/roku/` for project-specific knowledge (decisions, patterns, runbooks)
+- Check `_shared/` for cross-project patterns and conventions
+- WHEN you make an architectural decision, WRITE it to `projects/roku/decisions/YYYY-MM-DD-<topic>.md`
+- WHEN you discover a reusable pattern, WRITE it to `projects/roku/patterns/<name>.md`
+
+### Semantic Memory (memory-service MCP)
+- Use for fuzzy/conceptual searches ("how did we handle X?")
+- Tag all memories with metadata: `{source: "roku"}`
+- For factual/structural questions, check the vault first
+
+### Search Priority
+- Structured questions → vault (obsidian MCP search)
+- Conceptual/fuzzy questions → memory-service (semantic search)
+- If memory-service finds something valuable, consolidate it as a vault note
+```
+
+The personal and blend profiles follow the same template with adjusted paths (`projects/blend/`, etc.). The personal profile additionally has access to `personal/` and all project folders.
 
 ## Installation Steps (High-Level)
 
@@ -229,10 +298,37 @@ Each profile gets an `## Obsidian Memory` section with:
 | Risk | Mitigation |
 |------|-----------|
 | Context window bloat from too much memory | Vault scoping limits what Claude reads. CLAUDE.md stays under 100 lines. |
-| ChromaDB process management | Install as user service or use ONNX lightweight mode |
+| ChromaDB process management | mcp-memory-service embeds ChromaDB internally (no separate process). If it uses external ChromaDB, install as launchd user service. Verify during Phase 3 setup. |
+| Concurrent access from multiple profiles | Vault access is safe (file reads are non-destructive, writes are atomic per-file). ChromaDB: verify mcp-memory-service handles concurrent connections; if not, only one profile session should be active at a time, or use file-based locking. |
 | Graphify adds little value | It's the last phase and can be removed without affecting other layers |
 | MCP server conflicts between profiles | Each profile has independent settings.json, shared servers are stateless |
 | Obsidian vault gets messy over time | Templates and conventions keep structure clean. Periodic review. |
+
+## Day 1 Smoke Test
+
+After all phases are complete, run this test in a **new** personal profile session:
+
+1. Ask: "What Obsidian notes do I have about patterns?" → Verify Claude uses the obsidian MCP tool
+2. Ask: "What did we discuss about authentication last month?" → Verify Claude uses memory-service MCP
+3. Ask: "Search my past conversations for React Router" → Verify Claude uses episodic-memory
+4. Open a roku profile session and ask: "What's in my vault?" → Verify it only shows roku-scoped content
+5. Check session startup time — should be under 5 seconds added latency from MCP servers
+6. Open Obsidian, verify the vault is browsable and notes are readable
+
+## Graphify Output Convention
+
+- `graphify-out/` should be added to each project's `.gitignore` (it's generated output, not source)
+- Alternatively, store in vault under `projects/<name>/graph/` for cross-referencing (but this adds vault size)
+- Decision: gitignore by default, store in repo only if the team needs it for onboarding
+
+## Estimated Resource Usage
+
+| Component | Disk | RAM | CPU |
+|-----------|------|-----|-----|
+| Obsidian vault | ~50-200MB (grows with notes) | N/A (files on disk) | N/A |
+| ChromaDB (embedded) | ~500MB for 10K memories | ~200-500MB when active | Minimal |
+| Graphify output | ~5-20MB per project | N/A (generated files) | Only during analysis |
+| episodic-memory (existing) | ~700MB (current) | ~100MB when indexing | Minimal |
 
 ## Out of Scope
 
