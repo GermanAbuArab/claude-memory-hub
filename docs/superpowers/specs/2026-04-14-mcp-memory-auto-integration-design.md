@@ -17,7 +17,9 @@ Claude Code has MCP memory configured but doesn't use it automatically. Each ses
 
 ### 1. Memory Separation Strategy: Isolated Databases
 
-**Decision:** Each profile gets its own ChromaDB instance.
+**Decision:** Each profile gets its own SQLite-vec database instance.
+
+**Technology:** mcp-memory-service v10.36.7 with sqlite-vec backend and all-MiniLM-L6-v2 embeddings (384 dimensions).
 
 **Rationale:**
 - **Security:** Roku (corporate) data must never mix with personal projects
@@ -27,9 +29,9 @@ Claude Code has MCP memory configured but doesn't use it automatically. Each ses
 
 **Implementation:**
 ```
-~/.personal-claude/memory-db/  (personal projects only)
-~/.roku-claude/memory-db/      (Roku work only - isolated)
-~/.blend-claude/memory-db/     (Blend projects only)
+~/.personal-claude/memory-db/  (personal projects only - SQLite-vec)
+~/.roku-claude/memory-db/      (Roku work only - isolated SQLite-vec)
+~/.blend-claude/memory-db/     (Blend projects only - SQLite-vec)
 ```
 
 ### 2. Integration Approach: Hybrid (Hook + Instructions)
@@ -48,6 +50,97 @@ Claude Code has MCP memory configured but doesn't use it automatically. Each ses
 - Claude's contextual intelligence handles "what's important"
 - No performance overhead during work (only 2 hooks)
 - memory_harvest at end catches anything Claude missed
+
+### 3. Deduplication Strategy (CRITICAL)
+
+**User requirement:** "ten bastante cuidado con el dedup" — deduplication must be safe and conservative.
+
+#### memory_store Deduplication (Real-Time Capture)
+
+**Built-in behavior:**
+- Semantic deduplication enabled by default
+- Uses cosine similarity on embeddings to detect duplicates
+- Exact content hash matching prevents identical entries
+
+**conversation_id bypass:**
+```python
+# When saving incremental notes from SAME conversation:
+memory_store(
+  content="User decided to use PostgreSQL for session storage",
+  conversation_id="session_abc123",  # Bypasses semantic dedup
+  metadata={"tags": "decision,database"}
+)
+
+# Later in same conversation:
+memory_store(
+  content="PostgreSQL session table will use UUID primary keys",
+  conversation_id="session_abc123",  # Same ID = both stored despite similarity
+  metadata={"tags": "decision,database,schema"}
+)
+```
+
+**When to use conversation_id:**
+- Incremental decisions within ONE session (details emerging over time)
+- When you WANT to store related but distinct memories from same conversation
+- Default: DON'T use it (let semantic dedup work)
+
+#### memory_harvest Deduplication (SessionEnd)
+
+**Tool signature:**
+```python
+memory_harvest(
+  sessions=1,              # Number of recent sessions to harvest
+  dry_run=True,           # Preview before storing (ALWAYS use first)
+  use_llm=False,          # LLM validation (slower, more accurate)
+  min_confidence=0.6,     # Threshold for extraction (0.0-1.0)
+  types=["decision", "bug", "convention", "learning"]  # Optional filter
+)
+```
+
+**Safe harvest workflow:**
+
+1. **Preview first (dry_run=True):**
+```bash
+# Hook outputs:
+"Run memory_harvest with dry_run=True to preview candidates"
+```
+
+2. **Claude reviews candidates:**
+- Checks for duplicates with existing memories
+- Removes noise (e.g., "I'll look into that")
+- Validates quality
+
+3. **Confirm storage (dry_run=False):**
+```bash
+# Only after Claude approves:
+memory_harvest(sessions=1, dry_run=False, min_confidence=0.7)
+```
+
+**Dedup conflicts between memory_store and memory_harvest:**
+- If Claude saved a decision manually during session (via memory_store)
+- AND memory_harvest extracts the same decision at end
+- **Result:** Semantic dedup catches it, only ONE copy stored
+- **Hash:** Both use same content, same hash → duplicate rejected
+
+**Conservative parameters:**
+- `min_confidence=0.7` (higher = fewer false positives)
+- `dry_run=True` by default (manual approval required)
+- `use_llm=False` initially (faster, but can enable later if needed)
+
+#### Dedup Edge Cases
+
+| Scenario | Behavior | Safe? |
+|----------|----------|-------|
+| Same decision, different wording | Semantic dedup catches it | ✅ Yes |
+| Same decision, months apart | Stored as separate (temporal context differs) | ✅ Yes (evolution tracked) |
+| Incremental details (with conversation_id) | Both stored | ✅ Yes (intentional) |
+| Harvest + manual save (same session) | Semantic dedup merges | ✅ Yes (prevents spam) |
+| Accidental double-harvest | Hash matching prevents | ✅ Yes |
+
+**When dedup fails (false negatives):**
+- Extremely different wording for same concept
+- **Mitigation:** Periodic manual review + memory_delete for true duplicates
+- **Future:** Enable use_llm=True for LLM-powered dedup validation
 
 ## Architecture
 
@@ -82,7 +175,7 @@ Claude Code has MCP memory configured but doesn't use it automatically. Each ses
          ┌─────────────┼──────────────┐
          ▼             ▼              ▼
   personal-memory  roku-memory   blend-memory
-   (ChromaDB)      (ChromaDB)    (ChromaDB)
+   (SQLite-vec DB)      (SQLite-vec DB)    (SQLite-vec DB)
 ```
 
 ### Memory Flow
@@ -94,13 +187,13 @@ sequenceDiagram
     participant SessionStart Hook
     participant SessionEnd Hook
     participant Memory MCP
-    participant ChromaDB
+    participant SQLite-vec DB
 
     User->>Claude: Start session in project dir
     Claude->>SessionStart Hook: Trigger
     SessionStart Hook->>Memory MCP: Search for project context
-    Memory MCP->>ChromaDB: Semantic search
-    ChromaDB-->>Memory MCP: Relevant memories
+    Memory MCP->>SQLite-vec DB: Semantic search
+    SQLite-vec DB-->>Memory MCP: Relevant memories
     Memory MCP-->>SessionStart Hook: Context
     SessionStart Hook-->>Claude: Display context
 
@@ -108,13 +201,13 @@ sequenceDiagram
 
     Claude->>Claude: Makes architectural decision
     Claude->>Memory MCP: Store decision (via tool)
-    Memory MCP->>ChromaDB: Save with metadata
+    Memory MCP->>SQLite-vec DB: Save with metadata
 
     User->>Claude: End session
     Claude->>SessionEnd Hook: Trigger
     SessionEnd Hook->>Memory MCP: memory_harvest
-    Memory MCP->>ChromaDB: Extract & deduplicate learnings
-    ChromaDB-->>Memory MCP: Stored
+    Memory MCP->>SQLite-vec DB: Extract & deduplicate learnings
+    SQLite-vec DB-->>Memory MCP: Stored
 ```
 
 ## Implementation Details
@@ -220,7 +313,7 @@ EOF
 
 ### 3. SessionEnd Hook
 
-**Purpose:** Extract learnings from completed session.
+**Purpose:** Extract learnings from completed session with safe deduplication.
 
 **File:** `~/.{profile}-claude/hooks/session-end-harvest.sh`
 
@@ -233,21 +326,36 @@ PROFILE_NAME=$(basename "$(dirname "$(dirname "$0")")" | sed 's/-claude//')
 
 cat <<EOF
 <session-end-harvest>
-Session ended. Before closing:
+Session ended. Run memory harvest workflow:
 
-1. Review this session for important learnings
-2. Use memory_harvest to extract:
-   - Architectural decisions
-   - Bugs discovered and their root causes
-   - Conventions established
-   - Important project data discovered
+**Step 1: Preview (dry_run=True)**
+Use memory_harvest tool:
+{
+  "sessions": 1,
+  "dry_run": true,
+  "min_confidence": 0.7,
+  "types": ["decision", "bug", "convention", "learning", "context"]
+}
 
-Tag all memories with:
+**Step 2: Review candidates**
+- Check for duplicates with existing memories (search first)
+- Remove noise/trivial entries
+- Validate quality and relevance
+
+**Step 3: Store approved memories (dry_run=False)**
+Only if candidates look good:
+{
+  "sessions": 1,
+  "dry_run": false,
+  "min_confidence": 0.7
+}
+
+Tag all harvested memories with:
 - project: "$PROJECT_NAME"
 - profile: "$PROFILE_NAME"
 - session_date: "$(date +%Y-%m-%d)"
 
-Example: Use memory_harvest tool with tags metadata
+Note: Semantic dedup will merge with any manual saves from this session.
 </session-end-harvest>
 EOF
 ```
@@ -272,31 +380,43 @@ You have access to semantic memory via the `memory` MCP server.
   - Known issues or gotchas
 
 ### When to Save to Memory (During Work)
-Save IMMEDIATELY when you encounter or create:
+
+**Guideline:** Save when you make or discover something **significant and reusable**. Use your contextual judgment — not every change deserves a memory, only those that:
+- Would be valuable to recall in future sessions
+- Represent a decision point (not just implementation details)
+- Contain non-obvious project-specific knowledge
+
+**Save these categories:**
 
 **Architectural Decisions:**
-- Technology choices (libraries, frameworks, tools)
-- Design patterns chosen
-- Trade-offs made between approaches
-- System architecture changes
+- Technology choices (libraries, frameworks, tools) — save ONLY if non-trivial
+- Design patterns chosen that deviate from defaults
+- Trade-offs made between approaches (document WHY)
+- System architecture changes (new services, major refactors)
 
 **Important Project Data:**
-- API endpoints and integration URLs
-- Configuration values (non-secret)
-- Database/table/schema names
-- Service names and their purposes
-- Environment-specific details (dev, staging, prod)
+- API endpoints and integration URLs (non-secret, production/staging URLs)
+- Configuration values that aren't in code (feature flags, external IDs)
+- Database/table/schema names for key entities
+- Service names and their purposes (microservices, background jobs)
+- Environment-specific details (dev, staging, prod) that aren't obvious
 
 **Conventions Established:**
-- Naming conventions agreed upon
-- Code organization patterns
-- Git workflow decisions
-- Testing strategies
+- Naming conventions agreed upon (especially if project-specific)
+- Code organization patterns (folder structure, module boundaries)
+- Git workflow decisions (branching strategy, PR requirements)
+- Testing strategies (coverage thresholds, test data approach)
+
+**When NOT to save:**
+- Trivial implementation details ("added a function called getUserById")
+- Things already in code/docs/CLAUDE.md
+- Obvious choices ("used React for UI" in a React project)
+- Temporary decisions or experiments
 
 **Use this format:**
 ```
 mcp__memory__memory_store({
-  "content": "Clear description of what was decided/discovered",
+  "content": "Clear description of what was decided/discovered and WHY",
   "metadata": {
     "tags": "decision,project-name,relevant-tech",
     "type": "decision" | "project-data" | "convention",
@@ -305,6 +425,8 @@ mcp__memory__memory_store({
   }
 })
 ```
+
+**Deduplication note:** Don't worry about duplicates — semantic dedup will catch them. If unsure, save it. memory_harvest at session end will catch anything you miss.
 
 ### SessionEnd Harvest (Automatic)
 - At session end, you'll receive a reminder to run `memory_harvest`
@@ -323,7 +445,7 @@ mcp__memory__memory_store({
 ~/.personal-claude/
 ├── settings.json (updated with isolated memory-db path + hooks)
 ├── CLAUDE.md (updated with memory auto-capture instructions)
-├── memory-db/ (NEW - ChromaDB instance for personal)
+├── memory-db/ (NEW - SQLite-vec DB instance for personal)
 ├── memory-backups/ (NEW - backups for personal)
 └── hooks/
     ├── session-start-memory.sh (NEW)
@@ -422,7 +544,7 @@ interface MemoryEntry {
 ### Security Measures
 
 1. **Physical separation:** No shared database = no cross-contamination risk
-2. **No cloud sync:** ChromaDB stays local, never uploaded
+2. **No cloud sync:** SQLite-vec DB stays local, never uploaded
 3. **Profile tagging:** Even within a DB, all entries tagged with profile name
 4. **Backup isolation:** Each profile has its own backup directory
 5. **Access control:** File permissions on `~/.roku-claude/memory-db/` should be `700` (user-only)
@@ -453,7 +575,7 @@ interface MemoryEntry {
 - [ ] Start session in a project directory
 - [ ] Verify hook outputs context search reminder
 - [ ] Manually use memory_search to verify it works
-- [ ] Confirm correct DB path is being used (check ChromaDB files)
+- [ ] Confirm correct DB path is being used (check SQLite-vec DB files)
 
 **Phase 3: Manual Capture**
 - [ ] Make a fake architectural decision
@@ -471,7 +593,7 @@ interface MemoryEntry {
 - [ ] Store a memory in roku profile
 - [ ] Switch to personal profile
 - [ ] Search for that memory — should NOT appear
-- [ ] Verify separate ChromaDB directories exist
+- [ ] Verify separate SQLite-vec DB directories exist
 
 ## Migration Plan
 
@@ -540,7 +662,7 @@ OR: Start fresh (recommended — existing DB is empty anyway)
 
 ✅ **Profile Isolation:**
 - Roku memories never appear in personal profile searches
-- Each profile has its own ChromaDB instance
+- Each profile has its own SQLite-vec DB instance
 
 ✅ **Search Quality:**
 - Semantic search finds relevant memories even with different wording
